@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Canada Care Hospital Voice Assistant",
+  "description": "A professional AI voice receptionist for hospital appointment bookings, using Gemini Live API for real-time natural conversations.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
