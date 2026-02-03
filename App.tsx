@@ -6,40 +6,55 @@ import { encode, decode, decodeAudioData } from './utils/audio';
 
 const HOSPITAL_NAME = "Canada Care Hospital";
 const SYSTEM_INSTRUCTION = `
-You are the professional, polite, and calm hospital receptionist for ${HOSPITAL_NAME}.
-Your role is to assist with appointment bookings and hospital info.
+You are a professional, calm, and patient MULTILINGUAL hospital receptionist for ${HOSPITAL_NAME}.
 
-VOICE ETIQUETTE:
-- Be patient. Do not interrupt the user unless they clearly stop you.
-- Keep responses concise (1-2 sentences). 
-- If you hear background noise or a slight echo, ignore it and wait for clear speech.
-- Never end the session yourself; let the user say goodbye.
+====================
+STABILITY RULES (CRITICAL)
+====================
+- DO NOT INTERRUPT: Be extremely patient. If there is silence, wait at least 2 seconds before assuming the user is done.
+- STAY ACTIVE: Do not end the session or stop responding. If a user's intent is unclear, ask for clarification in their language.
+- PROCESSING: If you are "thinking," it is okay to take a moment, but do not close the connection.
 
-BOOKING SEQUENCE:
-1. Patient Name
-2. Department (General, Cardiology, Orthopedics, Pediatrics)
-3. Date
-4. Time
-5. Phone Number
+====================
+MULTILINGUAL PROTOCOL
+====================
+1. Detect the user's language (Tamil, Hindi, Bengali, English, etc.) and respond fluently in that SAME language.
+2. If the user switches languages, switch with them immediately.
 
-Confirm all details at the end. Use a calm, professional tone.
+====================
+PRIVACY & BOOKING
+====================
+- Never ask for Health IDs, Insurance, or Credit Cards. 
+- Sequence: Name -> Department -> Date -> Time -> Phone.
+- Confirmed details must be summarized at the end.
+- Never give medical advice.
 `;
 
 const App: React.FC = () => {
   const [status, setStatus] = useState<AppStatus>(AppStatus.IDLE);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [transcriptions, setTranscriptions] = useState<TranscriptionEntry[]>([]);
   const [isMuted, setIsMuted] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [hasAudioData, setHasAudioData] = useState(false);
   
   const audioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
-  const sessionRef = useRef<any>(null);
+  const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const nextStartTimeRef = useRef(0);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const streamRef = useRef<MediaStream | null>(null);
-  const micNodeRef = useRef<MediaStream | null>(null);
-  const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
+  
+  // Audio Recording Refs
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const mixerRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const audioUrlRef = useRef<string | null>(null);
+
+  // Persistent refs for audio nodes to prevent Garbage Collection
   const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
+  
   const transcriptionBufferRef = useRef({ user: '', agent: '' });
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -49,29 +64,39 @@ const App: React.FC = () => {
     }
   }, [transcriptions]);
 
-  const downloadTranscript = () => {
+  const downloadTranscript = useCallback(() => {
     if (transcriptions.length === 0) return;
-    const content = transcriptions.map(t => 
-      `[${t.timestamp.toLocaleTimeString()}] ${t.type.toUpperCase()}: ${t.text}`
-    ).join('\n');
-    const header = `${HOSPITAL_NAME} Call Record\nDate: ${new Date().toLocaleDateString()}\n\n`;
-    const blob = new Blob([header + content], { type: 'text/plain' });
+    const content = transcriptions.map(t => {
+      const time = t.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const role = t.type === 'user' ? 'Patient' : 'Receptionist';
+      return `[${time}] ${role}: ${t.text}`;
+    }).join('\n');
+    const blob = new Blob([content], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `Hospital_Call_${Date.now()}.txt`;
+    a.download = `canada-care-transcript-${Date.now()}.txt`;
     a.click();
     URL.revokeObjectURL(url);
-  };
+  }, [transcriptions]);
+
+  const downloadAudio = useCallback(() => {
+    if (!audioUrlRef.current) return;
+    const a = document.createElement('a');
+    a.href = audioUrlRef.current;
+    a.download = `hospital-call-recording-${Date.now()}.webm`;
+    a.click();
+  }, []);
 
   const handleStop = useCallback(() => {
-    if (sessionRef.current) {
-      try { sessionRef.current.close(); } catch(e) {}
-      sessionRef.current = null;
+    if (sessionPromiseRef.current) {
+      sessionPromiseRef.current.then(session => {
+        try { session.close(); } catch(e) {}
+      });
+      sessionPromiseRef.current = null;
     }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
+    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
+      recorderRef.current.stop();
     }
     if (processorNodeRef.current) {
       processorNodeRef.current.disconnect();
@@ -81,19 +106,28 @@ const App: React.FC = () => {
       sourceNodeRef.current.disconnect();
       sourceNodeRef.current = null;
     }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
     activeSourcesRef.current.forEach(source => {
       try { source.stop(); } catch(e) {}
     });
     activeSourcesRef.current.clear();
     nextStartTimeRef.current = 0;
     setStatus(AppStatus.IDLE);
+    setIsProcessing(false);
   }, []);
 
   const handleStart = async () => {
     try {
       setErrorMessage(null);
-      setStatus(AppStatus.CONNECTING);
+      setHasAudioData(false);
+      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = null;
+      recordedChunksRef.current = [];
       
+      setStatus(AppStatus.CONNECTING);
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
       if (!audioContextRef.current) {
@@ -109,6 +143,14 @@ const App: React.FC = () => {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
+      // Create Mixer for Call Recording
+      const mixer = outputAudioContextRef.current.createMediaStreamDestination();
+      mixerRef.current = mixer;
+
+      // Connect user mic to mixer
+      const micSource = outputAudioContextRef.current.createMediaStreamSource(stream);
+      micSource.connect(mixer);
+
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
@@ -123,43 +165,33 @@ const App: React.FC = () => {
         callbacks: {
           onopen: () => {
             setStatus(AppStatus.CONNECTED);
-            const source = audioContextRef.current!.createMediaStreamSource(stream);
-            const processor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
-            
-            sourceNodeRef.current = source;
-            processorNodeRef.current = processor;
-
-            processor.onaudioprocess = (e) => {
-              if (isMuted || !sessionRef.current) return;
-              
-              const inputData = e.inputBuffer.getChannelData(0);
-              const l = inputData.length;
-              const int16 = new Int16Array(l);
-              for (let i = 0; i < l; i++) {
-                int16[i] = inputData[i] * 32768;
-              }
-              
-              const pcmBlob = {
-                data: encode(new Uint8Array(int16.buffer)),
-                mimeType: 'audio/pcm;rate=16000',
-              };
-              
-              sessionRef.current.sendRealtimeInput({ media: pcmBlob });
+            // Start MediaRecorder
+            const recorder = new MediaRecorder(mixer.stream);
+            recorder.ondataavailable = (e) => {
+              if (e.data.size > 0) recordedChunksRef.current.push(e.data);
             };
-
-            source.connect(processor);
-            processor.connect(audioContextRef.current!.destination);
+            recorder.onstop = () => {
+              const blob = new Blob(recordedChunksRef.current, { type: 'audio/webm' });
+              audioUrlRef.current = URL.createObjectURL(blob);
+              setHasAudioData(true);
+            };
+            recorder.start();
+            recorderRef.current = recorder;
           },
           onmessage: async (message: LiveServerMessage) => {
             const base64Audio = message.serverContent?.modelTurn?.parts?.find(p => p.inlineData)?.inlineData?.data;
             if (base64Audio && outputAudioContextRef.current) {
+              setIsProcessing(false);
               const ctx = outputAudioContextRef.current;
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
               
               const buffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
               const source = ctx.createBufferSource();
               source.buffer = buffer;
+              
+              // Connect to speakers AND mixer
               source.connect(ctx.destination);
+              source.connect(mixerRef.current!);
               
               source.onended = () => activeSourcesRef.current.delete(source);
               source.start(nextStartTimeRef.current);
@@ -171,10 +203,12 @@ const App: React.FC = () => {
               activeSourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
               activeSourcesRef.current.clear();
               nextStartTimeRef.current = 0;
+              setIsProcessing(false);
             }
 
             if (message.serverContent?.inputTranscription) {
               transcriptionBufferRef.current.user += message.serverContent.inputTranscription.text;
+              setIsProcessing(true);
             }
             if (message.serverContent?.outputTranscription) {
               transcriptionBufferRef.current.agent += message.serverContent.outputTranscription.text;
@@ -185,21 +219,49 @@ const App: React.FC = () => {
               if (userText) setTranscriptions(prev => [...prev, { type: 'user', text: userText, timestamp: new Date() }]);
               if (agentText) setTranscriptions(prev => [...prev, { type: 'agent', text: agentText, timestamp: new Date() }]);
               transcriptionBufferRef.current = { user: '', agent: '' };
+              setIsProcessing(false);
             }
           },
           onerror: (e) => {
             console.error("Session Error:", e);
-            setErrorMessage("Connection interrupted. Please try again.");
+            setErrorMessage("Network issue. Reconnecting...");
             handleStop();
           },
           onclose: () => handleStop()
         }
       });
       
-      sessionRef.current = await sessionPromise;
+      sessionPromiseRef.current = sessionPromise;
+
+      // Audio stream to Gemini
+      const source = audioContextRef.current!.createMediaStreamSource(stream);
+      const processor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
+      sourceNodeRef.current = source;
+      processorNodeRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        if (isMuted) return;
+        const inputData = e.inputBuffer.getChannelData(0);
+        const l = inputData.length;
+        const int16 = new Int16Array(l);
+        for (let i = 0; i < l; i++) {
+          int16[i] = inputData[i] * 32768;
+        }
+        const pcmBlob = {
+          data: encode(new Uint8Array(int16.buffer)),
+          mimeType: 'audio/pcm;rate=16000',
+        };
+        sessionPromiseRef.current?.then((session) => {
+          session.sendRealtimeInput({ media: pcmBlob });
+        });
+      };
+
+      source.connect(processor);
+      processor.connect(audioContextRef.current!.destination);
+
     } catch (err) {
       console.error("Startup Error:", err);
-      setErrorMessage("Could not access microphone or server.");
+      setErrorMessage("Microphone access failed.");
       setStatus(AppStatus.IDLE);
     }
   };
@@ -218,16 +280,28 @@ const App: React.FC = () => {
               <h1 className="text-lg font-bold text-slate-800">Canada Care</h1>
             </div>
 
-            <button 
-              onClick={downloadTranscript}
-              disabled={transcriptions.length === 0}
-              className="w-full py-2.5 bg-indigo-50 text-indigo-700 rounded-xl text-xs font-black uppercase tracking-widest hover:bg-indigo-100 disabled:opacity-30 transition-all mb-4"
-            >
-              Export Call Log
-            </button>
+            <div className="space-y-2">
+              <button 
+                onClick={downloadTranscript}
+                disabled={transcriptions.length === 0}
+                className="w-full py-2.5 bg-indigo-50 text-indigo-700 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-indigo-100 disabled:opacity-30 transition-all flex items-center justify-center gap-2"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                Transcript
+              </button>
 
-            <div className="space-y-3 pt-4 border-t border-slate-100">
-              <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Available Depts</h3>
+              <button 
+                onClick={downloadAudio}
+                disabled={!hasAudioData}
+                className="w-full py-2.5 bg-emerald-50 text-emerald-700 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-emerald-100 disabled:opacity-30 transition-all flex items-center justify-center gap-2"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
+                Recording
+              </button>
+            </div>
+
+            <div className="space-y-3 pt-6 border-t border-slate-100 mt-4">
+              <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Departments</h3>
               <div className="flex flex-wrap gap-1.5">
                 {['General', 'Cardio', 'Ortho', 'Peds'].map(d => (
                   <span key={d} className="px-2 py-0.5 bg-slate-50 text-slate-500 rounded-md border border-slate-200 text-[10px] font-bold uppercase">{d}</span>
@@ -239,13 +313,13 @@ const App: React.FC = () => {
           <div className="bg-indigo-600 rounded-3xl p-5 shadow-lg text-white flex-1 flex flex-col justify-between overflow-hidden relative">
             <div>
               <h3 className="text-sm font-bold mb-1">Receptionist Live</h3>
-              <p className="text-[11px] text-indigo-100 leading-relaxed">Bookings, hours, and department information available 24/7.</p>
+              <p className="text-[11px] text-indigo-100 leading-relaxed">Multilingual session recording is currently enabled.</p>
             </div>
-            <div className="bg-white/10 px-3 py-2 rounded-xl border border-white/5">
-              <span className="text-[9px] font-bold uppercase block opacity-60 mb-1">Clinic Status</span>
+            <div className="bg-white/10 px-3 py-2 rounded-xl border border-white/5 z-10">
+              <span className="text-[9px] font-bold uppercase block opacity-60 mb-1">Status</span>
               <div className="flex items-center gap-2">
-                <div className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse" />
-                <span className="text-[10px] font-bold">OPENING HOURS: 9-6</span>
+                <div className={`w-1.5 h-1.5 rounded-full animate-pulse ${status === AppStatus.CONNECTED ? 'bg-green-400' : 'bg-slate-400'}`} />
+                <span className="text-[10px] font-bold uppercase">{status}</span>
               </div>
             </div>
             <div className="absolute -bottom-6 -right-6 w-24 h-24 bg-white/5 rounded-full blur-2xl" />
@@ -260,11 +334,16 @@ const App: React.FC = () => {
             <div className="flex items-center gap-2">
               <div className={`w-2.5 h-2.5 rounded-full ${status === AppStatus.CONNECTED ? 'bg-green-500 animate-pulse' : status === AppStatus.CONNECTING ? 'bg-amber-400 animate-bounce' : 'bg-slate-300'}`} />
               <span className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.2em]">
-                {status === AppStatus.CONNECTED ? 'Line Secure & Active' : status === AppStatus.CONNECTING ? 'Establishing Handshake' : 'Terminal Offline'}
+                {status === AppStatus.CONNECTED ? 'Call in Progress' : 'System Idle'}
               </span>
             </div>
+            {isProcessing && (
+              <span className="text-[9px] font-black text-indigo-500 bg-indigo-50 px-2 py-0.5 rounded uppercase animate-pulse">
+                Thinking...
+              </span>
+            )}
             {errorMessage && (
-              <span className="text-[10px] font-bold text-rose-500 bg-rose-50 px-3 py-1 rounded-full border border-rose-100 animate-pulse">
+              <span className="text-[10px] font-bold text-rose-500 bg-rose-50 px-3 py-1 rounded-full border border-rose-100">
                 {errorMessage}
               </span>
             )}
@@ -277,8 +356,8 @@ const App: React.FC = () => {
                 <div className="w-20 h-20 bg-slate-100 rounded-full flex items-center justify-center mb-6">
                   <svg className="w-10 h-10 text-slate-400" fill="currentColor" viewBox="0 0 20 20"><path d="M2 3a1 1 0 011-1h2.153a1 1 0 01.986.836l.74 4.435a1 1 0 01-.54 1.06l-1.548.773a11.037 11.037 0 006.105 6.105l.774-1.548a1 1 0 011.059-.54l4.435.74a1 1 0 01.836.986V17a1 1 0 01-1 1h-2C7.82 18 2 12.18 2 5V3z" /></svg>
                 </div>
-                <h4 className="text-sm font-bold text-slate-800 mb-1">Canada Care Reception</h4>
-                <p className="text-[11px] font-medium leading-relaxed">Press the call button below to start your private booking conversation.</p>
+                <h4 className="text-sm font-bold text-slate-800 mb-1">Secure Reception Line</h4>
+                <p className="text-[11px] font-medium leading-relaxed">Language is detected automatically. Tap the phone to start call.</p>
               </div>
             ) : (
               transcriptions.map((t, i) => (
@@ -293,7 +372,7 @@ const App: React.FC = () => {
                     </span>
                     <p className="text-sm font-medium leading-snug">{t.text}</p>
                     <span className="text-[8px] opacity-40 mt-1.5 block text-right font-mono">
-                      {t.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      {t.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </span>
                   </div>
                 </div>
@@ -307,7 +386,7 @@ const App: React.FC = () => {
               {status === AppStatus.IDLE || status === AppStatus.ERROR ? (
                 <button
                   onClick={handleStart}
-                  className="w-24 h-24 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full flex items-center justify-center shadow-2xl hover:shadow-indigo-200 transition-all transform active:scale-95 group relative"
+                  className="w-24 h-24 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full flex items-center justify-center shadow-2xl transition-all transform active:scale-95 group relative"
                 >
                   <div className="absolute inset-0 rounded-full bg-indigo-600 animate-ping opacity-10 group-hover:opacity-20" />
                   <svg className="w-10 h-10 group-hover:scale-110 transition-transform relative z-10" fill="currentColor" viewBox="0 0 20 20"><path d="M2 3a1 1 0 011-1h2.153a1 1 0 01.986.836l.74 4.435a1 1 0 01-.54 1.06l-1.548.773a11.037 11.037 0 006.105 6.105l.774-1.548a1 1 0 011.059-.54l4.435.74a1 1 0 01.836.986V17a1 1 0 01-1 1h-2C7.82 18 2 12.18 2 5V3z" /></svg>
@@ -345,7 +424,7 @@ const App: React.FC = () => {
               )}
             </div>
             <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.25em] text-center">
-              {status === AppStatus.CONNECTED ? (isMuted ? 'Secure Recording Paused' : 'Live Voice Transmission Encrypted') : 'Patient Voice Authentication Ready'}
+              {status === AppStatus.CONNECTED ? (isMuted ? 'Mic Paused' : 'Voice Link Active') : 'Canada Care Patient Terminal'}
             </p>
           </div>
         </main>
